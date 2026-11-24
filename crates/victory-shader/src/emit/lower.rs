@@ -147,6 +147,41 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// A load of less than a dword: its field width in bits, whether it is
+/// sign-extended, and for the `_d16` forms whether it fills the high half of
+/// its VGPR (the other half keeps its bits).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SubDword {
+    width: u32,
+    signed: bool,
+    half: Option<bool>,
+}
+
+/// The sub-dword load named by `rest`, what follows `buffer_load_` or
+/// `global_load_`: `ubyte`, `sbyte`, `ushort`, `sshort`, and the 16-bit
+/// `ubyte_d16`, `sbyte_d16`, `short_d16` with their `_hi` forms.
+fn sub_dword(rest: &str) -> Option<SubDword> {
+    let (stem, half) = match rest.strip_suffix("_d16_hi") {
+        Some(stem) => (stem, Some(true)),
+        None => match rest.strip_suffix("_d16") {
+            Some(stem) => (stem, Some(false)),
+            None => (rest, None),
+        },
+    };
+    let (width, signed) = match (stem, half) {
+        ("ubyte", _) => (8, false),
+        ("sbyte", _) => (8, true),
+        ("ushort", None) | ("short", Some(_)) => (16, false),
+        ("sshort", None) => (16, true),
+        _ => return None,
+    };
+    Some(SubDword {
+        width,
+        signed,
+        half,
+    })
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -577,6 +612,48 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
+    /// The field `sub` at byte address `off` of `w`, the dword holding it,
+    /// as the VGPR `reg` gets it: extended to a dword, or for the `_d16`
+    /// forms extended to 16 bits and put in its half of the old value.
+    // shortcut: the field is taken not to cross a dword.
+    fn sub_dword_value(
+        &mut self,
+        inst: &Inst,
+        reg: Reg,
+        w: V,
+        off: V,
+        sub: SubDword,
+    ) -> Result<V, Why> {
+        let c = self.cur;
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::And, off, three);
+        let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+        let x = self.s.m.bin(c, Bin::LShr, w, sh);
+        let left = self.s.m.i32(32 - sub.width);
+        let x = self.s.m.bin(c, Bin::Shl, x, left);
+        let ext = if sub.signed { Bin::AShr } else { Bin::LShr };
+        let x = self.s.m.bin(c, ext, x, left);
+        let Some(high) = sub.half else {
+            return Ok(x);
+        };
+        let old = match inst.read(reg) {
+            Some(o) => self.i32_of(o)?,
+            None => self.s.m.i32(0),
+        };
+        let low16 = self.s.m.i32(0xFFFF);
+        let x = self.s.m.bin(c, Bin::And, x, low16);
+        Ok(if high {
+            let kept = self.s.m.bin(c, Bin::And, old, low16);
+            let k16 = self.s.m.i32(16);
+            let x = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::Or, kept, x)
+        } else {
+            let high16 = self.s.m.i32(0xFFFF_0000);
+            let kept = self.s.m.bin(c, Bin::And, old, high16);
+            self.s.m.bin(c, Bin::Or, kept, x)
+        })
+    }
+
     /// A global memory load (`global_load_*`): from the program's constant
     /// table, or from a root SRV at the address the title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -587,15 +664,13 @@ impl<'a> Lower<'a> {
         let rest = name
             .strip_prefix("global_load_")
             .ok_or("a global memory write")?;
-        let (n, sub) = match rest {
-            "dword" => (1, None),
-            "dwordx2" => (2, None),
-            "dwordx3" => (3, None),
-            "dwordx4" => (4, None),
-            "ubyte" => (1, Some((8, false))),
-            "sbyte" => (1, Some((8, true))),
-            "ushort" => (1, Some((16, false))),
-            "sshort" => (1, Some((16, true))),
+        let sub = sub_dword(rest);
+        let n = match rest {
+            _ if sub.is_some() => 1,
+            "dword" => 1,
+            "dwordx2" => 2,
+            "dwordx3" => 3,
+            "dwordx4" => 4,
             _ => return Err(name),
         };
         let a = *self
@@ -648,19 +723,11 @@ impl<'a> Lower<'a> {
                     let at = self.s.m.bin(c, Bin::Add, off, four);
                     dword(self, at)?
                 }
-                Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
-                    let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                Some(sub) => {
+                    let not3 = self.s.m.i32(!3);
                     let at = self.s.m.bin(c, Bin::And, off, not3);
                     let w = dword(self, at)?;
-                    let byte = self.s.m.bin(c, Bin::And, off, three);
-                    let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
-                    let left = self.s.m.i32(32 - width);
-                    let x = self.s.m.bin(c, Bin::Shl, x, left);
-                    self.s
-                        .m
-                        .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
+                    self.sub_dword_value(inst, Reg::V(reg), w, off, sub)?
                 }
             };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -6195,12 +6262,13 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        let sub = plain.strip_prefix("buffer_load_").and_then(sub_dword);
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || sub.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -6261,6 +6329,14 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            if let Some(sub) = sub {
+                let not3 = self.s.m.i32(!3);
+                let at = self.s.m.bin(c, Bin::And, byte, not3);
+                let w = self.cbuffer_dword(h, at);
+                let x = self.sub_dword_value(inst, Reg::V(reg), w, byte, sub)?;
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
+            }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
@@ -6419,6 +6495,13 @@ impl<'a> Lower<'a> {
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
+            // A sub-dword load reads the dword holding its field.
+            let off = if sub.is_some() {
+                let not3 = self.s.m.i32(!3);
+                self.s.m.bin(c, Bin::And, off, not3)
+            } else {
+                off
+            };
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -6472,6 +6555,13 @@ impl<'a> Lower<'a> {
                 }
                 self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
             }
+            return Ok(());
+        }
+        if let Some(sub) = sub {
+            let w = self.s.m.extract(c, r, 0);
+            let w = self.as_int(w);
+            let x = self.sub_dword_value(inst, Reg::V(reg), w, off, sub)?;
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         for k in 0..count {
@@ -6947,7 +7037,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, SubDword, buffer_format, half_shift, lower, sub_dword};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -7417,5 +7507,77 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn sub_dword_loads_by_name() {
+        let sub = |width, signed, half| {
+            Some(SubDword {
+                width,
+                signed,
+                half,
+            })
+        };
+        assert_eq!(sub_dword("ubyte"), sub(8, false, None));
+        assert_eq!(sub_dword("sbyte"), sub(8, true, None));
+        assert_eq!(sub_dword("ushort"), sub(16, false, None));
+        assert_eq!(sub_dword("sshort"), sub(16, true, None));
+        assert_eq!(sub_dword("ubyte_d16"), sub(8, false, Some(false)));
+        assert_eq!(sub_dword("sbyte_d16_hi"), sub(8, true, Some(true)));
+        assert_eq!(sub_dword("short_d16"), sub(16, false, Some(false)));
+        assert_eq!(sub_dword("short_d16_hi"), sub(16, false, Some(true)));
+        for other in [
+            "dword",
+            "dwordx2",
+            "short",
+            "ushort_d16",
+            "format_d16_x",
+            "format_x",
+        ] {
+            assert_eq!(sub_dword(other), None, "{other}");
+        }
+    }
+
+    /// `op` (a MUBUF load opcode) at v0 of a byte-address buffer from the
+    /// table at s0 into v1, which first holds 0x12345678, stored to LDS so the
+    /// load is needed.
+    fn buffer_load_into_lds(op: u32) -> Result<Lowered, crate::ShaderError> {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7E02_02FF,
+            0x1234_5678,            // v_mov_b32 v1, 0x12345678
+            0xE000_1000 | op << 18, // buffer_load_<op> v1, v0, s[8:11], 0 offen
+            0x8002_0100,
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, vec![root(RootType::Table, 0, 0)], used)
+    }
+
+    #[test]
+    fn sub_dword_buffer_loads_lower() {
+        // buffer_load_dword, then ubyte, sbyte, ushort, sshort, and the d16
+        // forms (ubyte, sbyte, short; low and high halves).
+        for op in [
+            0x0c, 0x08, 0x09, 0x0a, 0x0b, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+        ] {
+            if let Err(e) = buffer_load_into_lds(op) {
+                panic!("buffer load opcode {op:#04x}: {e:?}");
+            }
+        }
     }
 }
